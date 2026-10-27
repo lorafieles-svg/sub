@@ -25,10 +25,12 @@
 ## Прототип
 
 ```bash
-cd demo && python3 -m http.server 8000
+python3 demo/server.py 8000      # http://localhost:8000
 ```
 
-Или просто откройте `demo/index.html` (для микрофона нужен `http://localhost` или `https`).
+`demo/server.py` — мини-сервер для превью: `no-store` (правки видны сразу, без кеша), правильные MIME для js/css/audio, CORS для встраивания в iframe. Обычный `python3 -m http.server` тоже работает, но кеширует агрессивнее.
+
+Можно открыть и просто `demo/index.html`, но для микрофона нужен безопасный контекст — `http://localhost` или `https`.
 
 **Что реально работает:**
 - синтез звука в Web Audio — не файлы: саб, дрон, пэд, воздух, генеративный реверб;
