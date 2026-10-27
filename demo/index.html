@@ -33,6 +33,13 @@
         потом медленно ведёт вас к вашему личному ритму покоя — и замолкает.
       </p>
 
+      <button class="mix-chip" id="mix-chip">
+        <span class="mix-dot"></span>
+        <span class="mix-label">среда</span>
+        <b id="mix-chip-name">Море + Ветер</b>
+        <span class="chev">›</span>
+      </button>
+
       <div class="duration-row" id="duration-row">
         <button class="chip" data-dur="90">90 сек</button>
         <button class="chip active" data-dur="180">3 мин</button>
@@ -48,9 +55,9 @@
     </div>
 
     <footer class="intro-foot">
-      <button class="ghost-link" id="btn-fingerprint-link">ваш отпечаток</button>
+      <button class="ghost-link" id="btn-sound">мастерская звука</button>
       <span class="sep">·</span>
-      <span id="sessions-count">сессий: 0</span>
+      <button class="ghost-link" id="btn-fingerprint-link">отпечаток</button>
       <span class="sep">·</span>
       <button class="ghost-link" id="btn-help">помощь</button>
     </footer>
@@ -105,6 +112,41 @@
     </div>
   </section>
 
+  <!-- ============ МАСТЕРСКАЯ ЗВУКА ============ -->
+  <section class="screen" id="s-sound">
+    <header class="topbar">
+      <button class="icon-btn back" id="btn-sound-back" aria-label="Назад">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <div class="brand small">МАСТЕРСКАЯ ЗВУКА</div>
+      <span style="width:36px"></span>
+    </header>
+
+    <div class="sound-body">
+      <p class="eyebrow">ваша среда</p>
+      <h2 class="mix-title" id="mix-title">Море + Ветер</h2>
+      <p class="sound-sub">Включайте сколько угодно слоёв. Громкость каждого — своя. Дыхание остаётся дирижёром.</p>
+
+      <div class="sound-actions">
+        <button class="pill-btn" id="btn-preview">Слушать среду</button>
+        <button class="ghost-link" id="btn-save-mix">сохранить среду</button>
+      </div>
+
+      <div class="layer-list" id="layer-list"></div>
+
+      <div class="saved">
+        <div class="saved-head">сохранённые среды</div>
+        <div class="saved-row" id="saved-row"></div>
+      </div>
+
+      <button class="ghost-link add-custom" id="btn-add-custom">+ добавить свой звук (mp3, wav, ogg · до 12 МБ)</button>
+      <input type="file" id="file-custom" accept="audio/*" hidden />
+
+      <button class="primary" id="btn-sound-breathe">Дышать с этой средой</button>
+      <p class="fine">Все среды синтезируются на устройстве. Ни одного скачанного файла — и никакой загрузки из сети.</p>
+    </div>
+  </section>
+
   <!-- ============ ОТПЕЧАТОК ============ -->
   <section class="screen" id="s-print">
     <header class="topbar">
@@ -152,6 +194,16 @@
       </div>
 
       <label class="row">
+        <span>Громкость</span>
+        <input type="range" id="set-volume" min="10" max="100" step="1" value="60" />
+      </label>
+
+      <label class="row">
+        <span>Отклик<br/><small>насколько сильно дыхание ведёт звук</small></span>
+        <input type="range" id="set-response" min="35" max="160" step="5" value="100" />
+      </label>
+
+      <label class="row">
         <span>Бас</span>
         <input type="range" id="set-bass" min="-6" max="6" step="1" value="0" />
       </label>
@@ -162,6 +214,15 @@
           <option value="dark">тёмный</option>
           <option value="neutral" selected>нейтральный</option>
           <option value="light">светлый</option>
+        </select>
+      </label>
+
+      <label class="row">
+        <span>Пространство</span>
+        <select id="set-room">
+          <option value="small">комната</option>
+          <option value="medium" selected>зал</option>
+          <option value="large">открытое</option>
         </select>
       </label>
 

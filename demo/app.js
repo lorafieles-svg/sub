@@ -1,6 +1,6 @@
 /* ============================================================
    ОТКЛИК — прототип ядра
-   Дыхание → звук → ведение → отпечаток.
+   Дыхание → звук → ведение → отпечаток → среда.
    Всё локально: аудио не пишется и не передаётся.
    ============================================================ */
 
@@ -8,11 +8,30 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const smoothstep = (t) => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
-const lerp = (a, b, t) => a + (b - a) * t;
+const frac = (x) => x - Math.floor(x);
+const TAU = Math.PI * 2;
 
 /* ---------------- настройки и хранилище ---------------- */
 
-const DEFAULTS = { bass: 0, timbre: 'neutral', mic: true, soft: false, haptics: false };
+const DEFAULT_MIX = { sea: 0.55, wind: 0.18 };
+
+const DEFAULTS = {
+  bass: 0,
+  timbre: 'neutral',
+  mic: true,
+  soft: false,
+  haptics: false,
+  volume: 0.6,
+  response: 1.0,      // «отклик»: насколько сильно дыхание управляет звуком
+  room: 'medium',     // размер пространства (реверб)
+  mix: DEFAULT_MIX,
+  mixes: [
+    { name: 'Берег', mix: { sea: 0.7, wind: 0.22 } },
+    { name: 'Лес утром', mix: { birds: 0.5, stream: 0.35, wind: 0.25 } },
+    { name: 'Ночь у огня', mix: { crickets: 0.45, fire: 0.35, wind: 0.15 } },
+    { name: 'Дождь', mix: { rain: 0.65, thunder: 0.25 } },
+  ],
+};
 
 const store = {
   get(k, d) {
@@ -25,10 +44,431 @@ const store = {
 };
 
 let settings = Object.assign({}, DEFAULTS, store.get('settings', {}));
-let history = store.get('history', []);       // [{ts, dur, mode, minutesToCalm, rate, quality, outcome}]
+let history = store.get('history', []);
 let fingerprint = store.get('fingerprint', { rf: null });
+let customSounds = [];   // [{id, name, buffer}] — свои файлы
 
-/* ---------------- звуковой движок ---------------- */
+const saveSettings = () => store.set('settings', settings);
+
+/* ============================================================
+   ГЕНЕРАТОРЫ СРЕД
+   Ни одного аудиофайла: каждая среда синтезируется в буфер
+   при первом включении. Семантика — не «трек», а текстура.
+   ============================================================ */
+
+function writeBurst(L, R, sr, pos, dur, amp, pan, decay) {
+  const len = Math.floor(dur * sr);
+  for (let j = 0; j < len; j++) {
+    const i = pos + j;
+    if (i < 0 || i >= L.length) continue;
+    const e = Math.exp(-(j / len) * (decay || 4));
+    const v = (Math.random() * 2 - 1) * e * amp;
+    L[i] += v * (1 - pan * 0.6);
+    R[i] += v * (0.3 + pan * 0.7);
+  }
+}
+
+function writeChirp(L, R, sr, pos, dur, f0, slope, amp, pan) {
+  const len = Math.floor(dur * sr);
+  let ph = 0;
+  for (let j = 0; j < len; j++) {
+    const u = j / len;
+    const f = f0 * (1 + (slope - 1) * u) * (1 + 0.03 * Math.sin(u * 40));
+    ph += (TAU * f) / sr;
+    const env = Math.pow(Math.sin(Math.PI * Math.min(1, u * 1.15)), 1.2) * Math.exp(-u * 1.5);
+    const v = Math.sin(ph) * env * amp;
+    const i = pos + j;
+    if (i < 0 || i >= L.length) continue;
+    L[i] += v * (1 - pan * 0.6);
+    R[i] += v * (0.25 + pan * 0.75);
+  }
+}
+
+function writeTone(L, R, sr, pos, dur, fStart, fEnd, amp, pan) {
+  const len = Math.floor(dur * sr);
+  let ph = 0;
+  for (let j = 0; j < len; j++) {
+    const u = j / len;
+    const f = fStart + (fEnd - fStart) * u;
+    ph += (TAU * f) / sr;
+    const env = Math.sin(Math.PI * u) ** 1.5;
+    const i = pos + j;
+    if (i < 0 || i >= L.length) continue;
+    const v = Math.sin(ph) * env * amp;
+    L[i] += v * (1 - pan * 0.6);
+    R[i] += v * (0.25 + pan * 0.75);
+  }
+}
+
+const GENERATORS = {
+  /* море: бурый шум + медленные волны + пена на гребне */
+  sea(L, R, sr) {
+    const n = L.length;
+    let bl = 0, br = 0;
+    const p1 = Math.random() * TAU, p2 = Math.random() * TAU, p3 = Math.random() * TAU;
+    const T1 = 9 + Math.random() * 3, T2 = 13 + Math.random() * 4, T3 = 6 + Math.random() * 2;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      let env = 0.45 + 0.3 * Math.sin((TAU * t) / T1 + p1) + 0.16 * Math.sin((TAU * t) / T2 + p2) + 0.09 * Math.sin((TAU * t) / T3 + p3);
+      env = clamp(env, 0.05, 1);
+      bl += (Math.random() * 2 - 1 - bl) * 0.012;
+      br += (Math.random() * 2 - 1 - br) * 0.012;
+      const foam = Math.pow(env, 5) * 0.09;
+      L[i] = bl * 3.2 * env + (Math.random() * 2 - 1) * foam;
+      R[i] = br * 3.2 * env + (Math.random() * 2 - 1) * foam;
+    }
+  },
+
+  /* дождь: высокочастотный шум + капли */
+  rain(L, R, sr) {
+    const n = L.length;
+    let hl = 0, hr = 0, pl = 0, pr = 0;
+    for (let i = 0; i < n; i++) {
+      const wl = Math.random() * 2 - 1, wr = Math.random() * 2 - 1;
+      hl = 0.92 * (hl + wl - pl); pl = wl;
+      hr = 0.92 * (hr + wr - pr); pr = wr;
+      L[i] = hl * 0.45;
+      R[i] = hr * 0.45;
+    }
+    const drops = Math.floor((n / sr) * 42);
+    for (let k = 0; k < drops; k++) {
+      const pos = Math.floor(Math.random() * n);
+      writeBurst(L, R, sr, pos, 0.004 + Math.random() * 0.018, 0.2 + Math.random() * 0.5, Math.random(), 3);
+    }
+  },
+
+  /* ручей: полосовой шум + пузырьки */
+  stream(L, R, sr) {
+    const n = L.length;
+    let hl = 0, pl = 0, lp = 0, lp2 = 0;
+    for (let i = 0; i < n; i++) {
+      const w = Math.random() * 2 - 1;
+      hl = 0.965 * (hl + w - pl); pl = w;
+      lp += (hl - lp) * 0.35;
+      lp2 += (lp - lp2) * 0.08;
+      const t = i / sr;
+      const mod = 0.75 + 0.25 * Math.sin((TAU * t) / 7.3);
+      L[i] = lp2 * 1.5 * mod;
+      R[i] = lp2 * 1.5 * mod * 0.92;
+    }
+    for (let k = 0; k < 70; k++) {
+      const pos = Math.floor(Math.random() * n);
+      writeTone(L, R, sr, pos, 0.04 + Math.random() * 0.1, 260 + Math.random() * 320, 620 + Math.random() * 700, 0.05 + Math.random() * 0.06, Math.random());
+    }
+  },
+
+  /* лес: ветер в кронах + птицы */
+  birds(L, R, sr) {
+    const n = L.length;
+    let lp = 0, lp2 = 0;
+    for (let i = 0; i < n; i++) {
+      const w = Math.random() * 2 - 1;
+      lp += (w - lp) * 0.01;
+      lp2 += (w - lp2) * 0.11;
+      const t = i / sr;
+      const amb = (lp * 0.4 + lp2 * 0.05) * (0.55 + 0.45 * Math.sin((TAU * t) / 13 + 1));
+      L[i] = amb;
+      R[i] = amb * 0.9;
+    }
+    const groups = Math.floor((n / sr) * 2.4) + 6;
+    for (let g = 0; g < groups; g++) {
+      const start = Math.random() * n;
+      const pan = 0.15 + Math.random() * 0.7;
+      const near = Math.random() > 0.35;
+      const notes = 1 + Math.floor(Math.random() * 4);
+      let off = 0;
+      for (let k = 0; k < notes; k++) {
+        const dur = 0.04 + Math.random() * 0.07;
+        const f0 = near ? 1900 + Math.random() * 2100 : 3000 + Math.random() * 1800;
+        const amp = (near ? 0.10 : 0.045) * (0.7 + Math.random() * 0.6);
+        writeChirp(L, R, sr, Math.floor(start + off * sr), dur, f0, 0.6 + Math.random() * 0.8, amp, pan);
+        off += dur + 0.02 + Math.random() * 0.05;
+      }
+    }
+  },
+
+  /* сверчки */
+  crickets(L, R, sr) {
+    const n = L.length;
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      lp += (Math.random() * 2 - 1 - lp) * 0.004;
+      L[i] = lp * 0.1;
+      R[i] = lp * 0.1;
+    }
+    for (let b = 0; b < 5; b++) {
+      const rate = 2.2 + Math.random() * 2.4;
+      const f = 3800 + Math.random() * 1500;
+      const pan = Math.random();
+      const amp = 0.05 + Math.random() * 0.09;
+      const tStart = Math.random() * 0.4;
+      const total = Math.floor((n / sr) * rate) + 1;
+      for (let c = 0; c < total; c++) {
+        const t0 = tStart + c / rate;
+        for (let p = 0; p < 3; p++) {
+          const pos = Math.floor((t0 + p * 0.021) * sr);
+          const len = Math.floor(0.009 * sr);
+          for (let j = 0; j < len; j++) {
+            const i = pos + j;
+            if (i < 0 || i >= n) continue;
+            const env = Math.sin((Math.PI * j) / len);
+            const v = Math.sin((TAU * f * j) / sr) * env * amp;
+            L[i] += v * (1 - pan * 0.8);
+            R[i] += v * (0.2 + pan * 0.8);
+          }
+        }
+      }
+    }
+  },
+
+  /* костёр: низкий гул + треск */
+  fire(L, R, sr) {
+    const n = L.length;
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      lp += (Math.random() * 2 - 1 - lp) * 0.006;
+      const t = i / sr;
+      const breath = 0.7 + 0.3 * Math.sin((TAU * t) / 5.7);
+      L[i] = lp * 0.5 * breath;
+      R[i] = lp * 0.5 * breath;
+    }
+    for (let k = 0; k < 260; k++) {
+      const pos = Math.floor(Math.random() * n);
+      const big = Math.random() > 0.93;
+      writeBurst(L, R, sr, pos, big ? 0.03 + Math.random() * 0.05 : 0.002 + Math.random() * 0.008, big ? 0.5 : 0.15 + Math.random() * 0.35, Math.random(), big ? 6 : 12);
+    }
+  },
+
+  /* ветер */
+  wind(L, R, sr) {
+    const n = L.length;
+    let lp = 0, lp2 = 0;
+    const p1 = Math.random() * TAU, p2 = Math.random() * TAU;
+    const T1 = 8 + Math.random() * 5, T2 = 15 + Math.random() * 6;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      const gust = clamp(0.5 + 0.4 * Math.sin((TAU * t) / T1 + p1) + 0.25 * Math.sin((TAU * t) / T2 + p2), 0.05, 1);
+      const a = 0.004 + 0.022 * gust;
+      lp += (Math.random() * 2 - 1 - lp) * a;
+      lp2 += (lp - lp2) * 0.45;
+      L[i] = lp2 * 3.4 * (0.35 + 0.65 * gust);
+      R[i] = lp2 * 3.4 * (0.35 + 0.65 * gust) * 0.88;
+    }
+  },
+
+  /* гроза: дождь + далёкий гром */
+  thunder(L, R, sr) {
+    const n = L.length;
+    let hl = 0, hr = 0, pl = 0, pr = 0, lp = 0;
+    for (let i = 0; i < n; i++) {
+      const wl = Math.random() * 2 - 1, wr = Math.random() * 2 - 1;
+      hl = 0.9 * (hl + wl - pl); pl = wl;
+      hr = 0.9 * (hr + wr - pr); pr = wr;
+      lp += (wl - lp) * 0.0018;
+      L[i] = hl * 0.18 + lp * 0.4;
+      R[i] = hr * 0.18 + lp * 0.4;
+    }
+    for (let k = 0; k < 2; k++) {
+      const pos = Math.floor((0.15 + k * 0.45 + Math.random() * 0.1) * n);
+      const len = Math.floor((1.6 + Math.random() * 1.8) * sr);
+      let prev = 0;
+      for (let j = 0; j < len; j++) {
+        const i = pos + j;
+        if (i >= n) break;
+        const u = j / len;
+        const env = Math.pow(1 - u, 2.2) * Math.min(1, u * 24) * 1.6;
+        prev += (Math.random() * 2 - 1 - prev) * 0.0035;
+        const v = prev * env * 6;
+        L[i] += v;
+        R[i] += v * 0.85;
+      }
+    }
+  },
+
+  /* поезд */
+  train(L, R, sr) {
+    const n = L.length;
+    let lp = 0, lp2 = 0, pl = 0;
+    for (let i = 0; i < n; i++) {
+      const w = Math.random() * 2 - 1;
+      lp += (w - lp) * 0.0015;
+      lp2 = 0.985 * (lp2 + w - pl); pl = w;
+      L[i] = lp * 2.2 + lp2 * 0.05;
+      R[i] = lp * 2.2 + lp2 * 0.06;
+    }
+    const period = 1.42;
+    for (let c = 0; c * period < n / sr; c++) {
+      const base = Math.floor((c * period + 0.1) * sr);
+      for (let p = 0; p < 4; p++) {
+        const pos = base + Math.floor(p * 0.075 * sr);
+        const len = Math.floor(0.045 * sr);
+        let prev = 0;
+        for (let j = 0; j < len; j++) {
+          const i = pos + j;
+          if (i < 0 || i >= n) continue;
+          prev += (Math.random() * 2 - 1 - prev) * 0.06;
+          const env = Math.exp(-(j / len) * 7);
+          const v = prev * env * 1.6;
+          L[i] += v;
+          R[i] += v * 0.9;
+        }
+      }
+    }
+  },
+
+  /* кафе: приглушённый говор + посуда */
+  cafe(L, R, sr) {
+    const n = L.length;
+    for (let v = 0; v < 4; v++) {
+      const pos0 = Math.floor(Math.random() * n);
+      const len = Math.floor((2 + Math.random() * 3) * sr);
+      const pan = Math.random();
+      const fBase = 180 + Math.random() * 220;
+      let ph = 0, lp = 0, lp2 = 0;
+      for (let j = 0; j < len; j++) {
+        const i = (pos0 + j) % n;
+        const u = j / len;
+        const env = Math.sin(Math.PI * u) * 0.5 + 0.1;
+        ph += (TAU * (fBase + 30 * Math.sin(u * 27))) / sr;
+        const src = Math.sin(ph) * 0.5 + (Math.random() * 2 - 1) * 0.5;
+        lp += (src - lp) * 0.18;
+        lp2 += (lp - lp2) * 0.35;
+        const val = lp2 * env * 0.16;
+        L[i] += val * (1 - pan * 0.5);
+        R[i] += val * (0.5 + pan * 0.5);
+      }
+    }
+    for (let k = 0; k < 22; k++) {
+      const pos = Math.floor(Math.random() * n);
+      writeTone(L, R, sr, pos, 0.08 + Math.random() * 0.16, 2400 + Math.random() * 1600, 2200 + Math.random() * 1400, 0.03 + Math.random() * 0.05, Math.random());
+    }
+    for (let k = 0; k < 5; k++) {
+      const pos = Math.floor(Math.random() * n);
+      writeBurst(L, R, sr, pos, 0.12 + Math.random() * 0.2, 0.05, Math.random(), 2.5);
+    }
+  },
+};
+
+/* ---- каталог сред ---- */
+
+// target — целевая RMS буфера: балансируем «плотные» и «редкие» текстуры,
+// иначе птицы с редкими событиями звучат громче дождя
+const LAYERS = {
+  sea:      { name: 'Море',    group: 'Вода',   icon: 'waves',   gen: GENERATORS.sea,      target: 0.19 },
+  stream:   { name: 'Ручей',   group: 'Вода',   icon: 'stream',  gen: GENERATORS.stream,   target: 0.18 },
+  rain:     { name: 'Дождь',   group: 'Вода',   icon: 'rain',    gen: GENERATORS.rain,     target: 0.16 },
+  birds:    { name: 'Птицы',   group: 'Лес',    icon: 'bird',    gen: GENERATORS.birds,    target: 0.10 },
+  wind:     { name: 'Ветер',   group: 'Лес',    icon: 'wind',    gen: GENERATORS.wind,     target: 0.16 },
+  crickets: { name: 'Сверчки', group: 'Ночь',   icon: 'moon',    gen: GENERATORS.crickets, target: 0.095 },
+  fire:     { name: 'Костёр',  group: 'Огонь',  icon: 'fire',    gen: GENERATORS.fire,     target: 0.12 },
+  thunder:  { name: 'Гроза',   group: 'Погода', icon: 'thunder', gen: GENERATORS.thunder,  target: 0.165 },
+  train:    { name: 'Поезд',   group: 'Город',  icon: 'train',   gen: GENERATORS.train,    target: 0.16 },
+  cafe:     { name: 'Кафе',    group: 'Город',  icon: 'cafe',    gen: GENERATORS.cafe,     target: 0.10 },
+};
+
+const GROUPS = ['Вода', 'Лес', 'Ночь', 'Огонь', 'Погода', 'Город', 'Мои звуки'];
+
+const ICONS = {
+  waves: '<path d="M2 15c2.2-2.2 4.4-2.2 6.6 0s4.4 2.2 6.6 0 4.4-2.2 6.6 0"/><path d="M2 10c2.2-2.2 4.4-2.2 6.6 0s4.4 2.2 6.6 0 4.4-2.2 6.6 0"/>',
+  stream: '<path d="M8 3c-2 3 2 4 0 7s2 4 0 7"/><path d="M15 3c-2 3 2 4 0 7s2 4 0 7"/>',
+  rain: '<path d="M6.5 11a4 4 0 0 1 7.7-1.3A3 3 0 0 1 18 15.4H7.2A3 3 0 0 1 6.5 11z"/><path d="M8 17.5l-1 3M12 17.5l-1 3M16 17.5l-1 3"/>',
+  bird: '<path d="M3 13c2.4-3.6 5.4-3.6 7.2 0C12 9.4 15 9.4 17.4 13"/><path d="M17 7.5c1.6 0 2.6 1 2.6 2.2"/>',
+  wind: '<path d="M3 8h9a2.4 2.4 0 1 0-2.4-2.4"/><path d="M3 13h13a2.4 2.4 0 1 1-2.4 2.4"/><path d="M3 18h6"/>',
+  moon: '<path d="M16 3.5a8.5 8.5 0 1 0 4.2 13.2A7 7 0 0 1 16 3.5z"/>',
+  fire: '<path d="M12 3s4.6 3.7 4.6 7.6a4.6 4.6 0 0 1-9.2 0c0-1.8.8-2.8 1.8-3.9 0 1.9.8 2.8 1.8 2.8 0-2.6.6-4.4 1-6.5z"/>',
+  thunder: '<path d="M6.5 10a4 4 0 0 1 7.7-1.3A3 3 0 0 1 18 14.4H7.2A3 3 0 0 1 6.5 10z"/><path d="M13 13l-2.6 4.6h3.2L11.4 22l4.2-5.6h-3.2z"/>',
+  train: '<rect x="5" y="4" width="14" height="12" rx="3"/><path d="M5 10h14M9 16v3M15 16v3M7 21h10"/>',
+  cafe: '<path d="M4 8h11v5.5A4.5 4.5 0 0 1 10.5 18h-2A4.5 4.5 0 0 1 4 13.5z"/><path d="M15 9.5h1.8a2.4 2.4 0 1 1 0 4.8H15"/><path d="M7 4.5c-.8 1 .8 1.6 0 2.6M11 4.5c-.8 1 .8 1.6 0 2.6"/>',
+  wave2: '<path d="M4 12h2M9 8v8M14 5v14M19 10v4"/>',
+  more: '<path d="M12 5v14M5 12h14"/>',
+};
+
+/* ============================================================
+   СВОИ ЗВУКИ (IndexedDB, локально)
+   ============================================================ */
+
+function idbOpen() {
+  return new Promise((res, rej) => {
+    if (!window.indexedDB) return rej(new Error('no idb'));
+    const r = indexedDB.open('otklik', 1);
+    r.onupgradeneeded = () => { try { r.result.createObjectStore('sounds', { keyPath: 'id' }); } catch {} };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+async function idbAll() {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction('sounds', 'readonly');
+      const req = tx.objectStore('sounds').getAll();
+      req.onsuccess = () => res(req.result || []);
+      req.onerror = () => rej(req.error);
+    });
+  } catch { return []; }
+}
+
+async function idbPut(obj) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res) => {
+      const tx = db.transaction('sounds', 'readwrite');
+      tx.objectStore('sounds').put(obj);
+      tx.oncomplete = () => res(true);
+      tx.onerror = () => res(false);
+    });
+  } catch { return false; }
+}
+
+async function idbDel(id) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res) => {
+      const tx = db.transaction('sounds', 'readwrite');
+      tx.objectStore('sounds').delete(id);
+      tx.oncomplete = () => res(true);
+      tx.onerror = () => res(false);
+    });
+  } catch { return false; }
+}
+
+function decodeAudio(arrayBuffer, sr) {
+  const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 1, sr || 48000);
+  return new Promise((res, rej) => {
+    const p = ctx.decodeAudioData(arrayBuffer, res, rej);
+    if (p && p.then) p.then(res).catch(rej);
+  });
+}
+
+async function loadCustomSounds() {
+  const rows = await idbAll();
+  for (const row of rows) {
+    try {
+      const buf = await decodeAudio(row.data, 48000);
+      customSounds.push({ id: row.id, name: row.name, buffer: buf });
+    } catch {}
+  }
+  Object.keys(settings.mix || {}).forEach((id) => {
+    if (id.startsWith('my-') && !customSounds.find((c) => c.id === id)) delete settings.mix[id];
+  });
+}
+
+function layerDef(id) {
+  if (LAYERS[id]) return LAYERS[id];
+  const c = customSounds.find((s) => s.id === id);
+  if (c) return { name: c.name, group: 'Мои звуки', icon: 'wave2', buffer: c.buffer, custom: true };
+  return null;
+}
+
+function layerName(id) {
+  const d = layerDef(id);
+  return d ? d.name : null;
+}
+
+/* ============================================================
+   АУДИО-ДВИЖОК
+   ============================================================ */
 
 const SCALES = {
   dark:    { notes: [55.0, 82.41, 110.0, 130.81], pad: [110.0, 164.81, 220.0, 261.63] },
@@ -36,11 +476,79 @@ const SCALES = {
   light:   { notes: [87.31, 130.81, 174.61, 220.0], pad: [174.61, 261.63, 349.23, 440.0] },
 };
 
+const ROOMS = { small: { sec: 1.4, decay: 3.2, mix: 0.18 }, medium: { sec: 2.6, decay: 2.4, mix: 0.26 }, large: { sec: 4.4, decay: 1.9, mix: 0.36 } };
+
+const bufferCache = new Map();
+
+function normalizeBuffer(buf, targetRms) {
+  const chans = [];
+  let sum = 0, n = 0, peak = 0;
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    const d = buf.getChannelData(ch);
+    chans.push(d);
+    for (let i = 0; i < d.length; i++) {
+      sum += d[i] * d[i];
+      peak = Math.max(peak, Math.abs(d[i]));
+    }
+    n += d.length;
+  }
+  if (!n || peak === 0) return;
+  const rms = Math.sqrt(sum / n);
+  let g = (targetRms || 0.1) / Math.max(0.0001, rms);
+  if (peak * g > 0.9) g = 0.9 / peak;
+  chans.forEach((d) => { for (let i = 0; i < d.length; i++) d[i] *= g; });
+}
+
+function crossfadeLoop(ctx, buf, seconds) {
+  const sr = buf.sampleRate;
+  const X = Math.floor(seconds * sr);
+  const len = buf.length - X;
+  const out = ctx.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++) {
+    const s = buf.getChannelData(Math.min(ch, buf.numberOfChannels - 1));
+    const d = out.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      d[i] = s[i];
+      if (i < X) {
+        const t = i / X;
+        d[i] = s[i] * t + s[len + i] * (1 - t);
+      }
+    }
+  }
+  return out;
+}
+
+function getLayerBuffer(id, def, ctx) {
+  // свои файлы: та же обработка, что и у встроенных слоёв —
+  // нормализация по RMS и бесшовная петля, иначе на стыке слышен щелчок
+  if (def.buffer) {
+    const key = 'custom:' + id;
+    let b = bufferCache.get(key);
+    if (!b) {
+      b = def.buffer;
+      try { normalizeBuffer(b, 0.15); } catch {}
+      try { if (b.length > b.sampleRate * 1.2) b = crossfadeLoop(ctx, b, 0.35); } catch {}
+      bufferCache.set(key, b);
+    }
+    return b;
+  }
+  const key = id + '@' + ctx.sampleRate;
+  let b = bufferCache.get(key);
+  if (b) return b;
+  const seconds = 12;
+  b = ctx.createBuffer(2, Math.floor(ctx.sampleRate * seconds), ctx.sampleRate);
+  def.gen(b.getChannelData(0), b.getChannelData(1), ctx.sampleRate);
+  normalizeBuffer(b, def.target || 0.08);
+  b = crossfadeLoop(ctx, b, 0.35);
+  bufferCache.set(key, b);
+  return b;
+}
+
 class AudioEngine {
   constructor() {
     this.ctx = null;
     this.running = false;
-    this.env = 0;
+    this.layers = new Map();
   }
 
   init() {
@@ -49,8 +557,8 @@ class AudioEngine {
     if (this.ctx.state === 'suspended') this.ctx.resume();
 
     const ctx = this.ctx;
+    const room = ROOMS[settings.room] || ROOMS.medium;
 
-    // мастер-цепочка: лимитер защищает слух
     this.master = ctx.createGain();
     this.master.gain.value = 0;
     const comp = ctx.createDynamicsCompressor();
@@ -58,20 +566,19 @@ class AudioEngine {
     comp.attack.value = 0.02; comp.release.value = 0.3;
     this.master.connect(comp).connect(ctx.destination);
 
-    // реверб: генерируем импульс сами — никаких сэмплов
     this.reverb = ctx.createConvolver();
-    this.reverb.buffer = this._impulse(2.6, 2.4);
-    this.wet = ctx.createGain(); this.wet.gain.value = 0.28;
+    this.reverb.buffer = this._impulse(room.sec, room.decay);
+    this.wet = ctx.createGain(); this.wet.gain.value = room.mix;
     this.dry = ctx.createGain(); this.dry.gain.value = 0.85;
     this.reverb.connect(this.wet).connect(this.master);
     this.dry.connect(this.master);
 
-    // подложка: дрон через ФНЧ
+    /* --- генеративная основа --- */
     this.droneFilter = ctx.createBiquadFilter();
     this.droneFilter.type = 'lowpass';
     this.droneFilter.frequency.value = 420;
     this.droneFilter.Q.value = 0.9;
-    this.droneGain = ctx.createGain(); this.droneGain.gain.value = 0.0;
+    this.droneGain = ctx.createGain(); this.droneGain.gain.value = 0;
     this.droneFilter.connect(this.droneGain);
     this.droneGain.connect(this.dry); this.droneGain.connect(this.reverb);
 
@@ -89,7 +596,6 @@ class AudioEngine {
       this.oscs.push(o);
     });
 
-    // саб — «телесный» бас
     this.subGain = ctx.createGain(); this.subGain.gain.value = 0;
     this.subGain.connect(this.dry);
     [46, 48.5].forEach((f) => {
@@ -97,7 +603,6 @@ class AudioEngine {
       o.connect(this.subGain); o.start(); this.oscs.push(o);
     });
 
-    // пэд — аккорд
     this.padGain = ctx.createGain(); this.padGain.gain.value = 0;
     this.padFilter = ctx.createBiquadFilter();
     this.padFilter.type = 'lowpass'; this.padFilter.frequency.value = 1200;
@@ -110,7 +615,6 @@ class AudioEngine {
       o.connect(g).connect(this.padFilter); o.start(); this.oscs.push(o);
     });
 
-    // воздух — шум через полосовой фильтр
     this.airGain = ctx.createGain(); this.airGain.gain.value = 0;
     this.airFilter = ctx.createBiquadFilter();
     this.airFilter.type = 'bandpass'; this.airFilter.frequency.value = 700; this.airFilter.Q.value = 0.7;
@@ -124,18 +628,26 @@ class AudioEngine {
     noise.start();
     this.oscs.push(noise);
 
-    // медленный панорамный дрейф
-    const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
-    if (pan) {
-      pan.pan.value = 0;
+    /* --- среда --- */
+    this.ambientBus = ctx.createGain();
+    this.ambientBus.gain.value = 0;
+    this.ambientBus.connect(this.dry);
+    const ambWet = ctx.createGain();
+    ambWet.gain.value = 0.3;
+    this.ambientBus.connect(ambWet).connect(this.reverb);
+
+    // панорама
+    if (ctx.createStereoPanner) {
+      const pan = ctx.createStereoPanner();
       this.master.disconnect();
       this.master.connect(pan).connect(comp);
       const lfo = ctx.createOscillator(); lfo.frequency.value = 0.03;
-      const lg = ctx.createGain(); lg.gain.value = 0.35;
+      const lg = ctx.createGain(); lg.gain.value = 0.3;
       lfo.connect(lg).connect(pan.pan); lfo.start(); this.oscs.push(lfo);
     }
 
     this.space = 0;
+    this.applyMix();
   }
 
   _noise(seconds) {
@@ -153,41 +665,96 @@ class AudioEngine {
     const buf = ctx.createBuffer(2, len, ctx.sampleRate);
     for (let c = 0; c < 2; c++) {
       const d = buf.getChannelData(c);
-      for (let i = 0; i < len; i++) {
-        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
-      }
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
     }
     return buf;
+  }
+
+  /* --- слои среды --- */
+
+  ensureLayer(id) {
+    if (this.layers.has(id)) return this.layers.get(id);
+    const def = layerDef(id);
+    if (!def) return null;
+    let buf;
+    try { buf = getLayerBuffer(id, def, this.ctx); } catch { return null; }
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+    const pan = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
+    if (pan) {
+      pan.pan.value = (Math.random() - 0.5) * 0.25;
+      src.connect(gain).connect(pan).connect(this.ambientBus);
+    } else {
+      src.connect(gain).connect(this.ambientBus);
+    }
+    src.start();
+    const node = { src, gain, def };
+    this.layers.set(id, node);
+    this.oscs.push(src);
+    return node;
+  }
+
+  setLayer(id, v) {
+    const node = this.ensureLayer(id);
+    if (!node) return;
+    const t = this.ctx.currentTime;
+    const target = Math.pow(clamp(v, 0, 1), 1.25);
+    node.gain.gain.setTargetAtTime(target, t, 0.25);
+    node.target = target;
+  }
+
+  applyMix() {
+    if (!this.ctx) return;
+    Object.keys(settings.mix || {}).forEach((id) => {
+      const v = settings.mix[id];
+      if (v > 0.001) this.setLayer(id, v);
+      else if (this.layers.has(id)) this.setLayer(id, 0);
+    });
+  }
+
+  refreshMix() {
+    if (!this.ctx) return;
+    Object.entries(settings.mix || {}).forEach(([id, v]) => {
+      if (this.layers.has(id)) this.setLayer(id, v);
+      else if (v > 0.001) this.setLayer(id, v);
+    });
   }
 
   start() {
     const t = this.ctx.currentTime;
     this.master.gain.cancelScheduledValues(t);
     this.master.gain.setValueAtTime(0.0001, t);
-    this.master.gain.exponentialRampToValueAtTime(0.55, t + 3.5);
+    const target = 0.18 + 0.60 * clamp(settings.volume, 0, 1);
+    this.master.gain.exponentialRampToValueAtTime(target, t + 3.2);
     this.running = true;
   }
 
-  /** обновление параметров графа от дыхания */
   update({ env, phase, slope, lead, space }) {
     if (!this.running) return;
-    const ctx = this.ctx, t = ctx.currentTime, tau = 0.09;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const k = clamp(settings.response, 0.35, 1.6);
+    const e = clamp(0.5 + (env - 0.5) * k, 0, 1);
+
     const timbreShift = settings.timbre === 'dark' ? -120 : settings.timbre === 'light' ? 220 : 0;
     const bassMul = Math.pow(2, settings.bass / 6);
-    const air = clamp(slope * 6, 0, 1);
+    const air = clamp(slope * 6 * k, 0, 1);
 
-    const cutoff = clamp(240 + 620 * env + timbreShift, 90, 4200);
-    this.droneFilter.frequency.setTargetAtTime(cutoff, t, tau);
-
-    const droneLevel = (space ? 0.10 : 0.20) * (0.45 + 0.55 * env);
-    this.droneGain.gain.setTargetAtTime(droneLevel, t, 0.2);
-
-    this.subGain.gain.setTargetAtTime((0.05 + 0.16 * env) * bassMul * (space ? 0.4 : 1), t, 0.12);
+    this.droneFilter.frequency.setTargetAtTime(clamp(240 + 620 * e + timbreShift, 90, 4200), t, 0.09);
+    this.droneGain.gain.setTargetAtTime((space ? 0.10 : 0.20) * (0.45 + 0.55 * e), t, 0.2);
+    this.subGain.gain.setTargetAtTime((0.05 + 0.16 * e) * bassMul * (space ? 0.4 : 1), t, 0.12);
     this.airGain.gain.setTargetAtTime(0.015 + 0.085 * air, t, 0.08);
-    this.airFilter.frequency.setTargetAtTime(320 + 900 * env, t, 0.1);
-    this.padGain.gain.setTargetAtTime((lead ? 0.075 : 0.13) * (0.6 + 0.4 * env), t, 0.3);
-    this.wet.gain.setTargetAtTime(0.24 + 0.22 * (1 - env), t, 0.25);
-    this.droneFilter.Q.setTargetAtTime(0.9 + 1.6 * (1 - env), t, 0.25);
+    this.airFilter.frequency.setTargetAtTime(320 + 900 * e, t, 0.1);
+    this.padGain.gain.setTargetAtTime((lead ? 0.075 : 0.13) * (0.6 + 0.4 * e), t, 0.3);
+    this.wet.gain.setTargetAtTime((ROOMS[settings.room] || ROOMS.medium).mix + 0.2 * (1 - e), t, 0.25);
+    this.droneFilter.Q.setTargetAtTime(0.9 + 1.6 * (1 - e), t, 0.25);
+
+    // среда дышит вместе с вами, но очень деликатно — и уходит в тишину в финале
+    const ambLevel = (0.82 + 0.18 * e) * (1 - 0.88 * (space || 0));
+    this.ambientBus.gain.setTargetAtTime(ambLevel, t, 0.3);
   }
 
   stop(fast) {
@@ -210,7 +777,9 @@ class AudioEngine {
   }
 }
 
-/* ---------------- детектор дыхания ---------------- */
+/* ============================================================
+   ДЕТЕКТОР ДЫХАНИЯ
+   ============================================================ */
 
 class BreathDetector {
   constructor(ctx) {
@@ -226,7 +795,6 @@ class BreathDetector {
     this.rate = null;
     this.quality = 0;
     this.lastSignal = 0;
-    this.t = 0;
   }
 
   async start() {
@@ -246,7 +814,7 @@ class BreathDetector {
     return true;
   }
 
-  tick(dt) {
+  tick() {
     if (!this.ready) return this.state();
     this.analyser.getByteFrequencyData(this.buf);
 
@@ -254,31 +822,38 @@ class BreathDetector {
     for (let i = this.lo; i < this.hi; i++) { sum += this.buf[i]; n++; }
     const raw = (sum / n) / 255;
 
-    // адаптивные шум/пик
     if (raw < this.floor) this.floor = this.floor * 0.92 + raw * 0.08;
     else this.floor += 0.00008;
     if (raw > this.peak) this.peak = raw; else this.peak *= 0.9993;
     const span = Math.max(0.02, this.peak - this.floor);
-
     const norm = clamp((raw - this.floor) / span, 0, 1);
 
-    // асимметричное сглаживание: вдох «быстрее», выдох «мягче»
     const a = norm > this.env ? 0.30 : 0.09;
     this.prevEnv = this.env;
     this.env += (norm - this.env) * a;
 
-    // фаза с гистерезисом
+    // адаптивные пороги: локальные min/max огибающей.
+    // фиксированные 0.55/0.28 не работают на поверхностном дыхании —
+    // огибающая просто не опускается ниже порога, и частота не считается
+    if (this.envMin == null) { this.envMin = this.env; this.envMax = this.env; }
+    this.envMin += (this.env - this.envMin) * (this.env < this.envMin ? 0.25 : 0.0015);
+    this.envMax += (this.env - this.envMax) * (this.env > this.envMax ? 0.25 : 0.0015);
+    const dyn = this.envMax - this.envMin;
+    const hi = this.envMin + 0.62 * dyn;
+    const lo = this.envMin + 0.28 * dyn;
+
     const now = performance.now();
-    if (this.env > 0.55 && this.phase !== 'inhale') {
+    if (this.lastOnset == null) this.lastOnset = 0;
+    if (dyn > 0.12 && this.env > hi && this.phase !== 'inhale' && now - this.lastOnset > 1200) {
       this.phase = 'inhale';
+      this.lastOnset = now;
       this.onsets.push(now);
       if (this.onsets.length > 8) this.onsets.shift();
       if (settings.haptics && navigator.vibrate) navigator.vibrate(14);
-    } else if (this.env < 0.28 && this.phase !== 'exhale') {
+    } else if (this.env < lo && this.phase !== 'exhale') {
       this.phase = 'exhale';
     }
 
-    // частота по интервалам вдохов
     const iv = [];
     for (let i = 1; i < this.onsets.length; i++) {
       const d = (this.onsets[i] - this.onsets[i - 1]) / 1000;
@@ -293,9 +868,8 @@ class BreathDetector {
     }
 
     const snr = clamp((span - 0.03) / 0.16, 0, 1);
-    const validShare = clamp(iv.length / 4, 0, 1);
-    this.quality = clamp(snr * 0.6 + validShare * 0.4, 0, 1);
-
+    const dynamics = clamp(dyn / 0.35, 0, 1);
+    this.quality = clamp(snr * 0.45 + clamp(iv.length / 4, 0, 1) * 0.35 + dynamics * 0.2, 0, 1);
     return this.state();
   }
 
@@ -318,15 +892,15 @@ class BreathDetector {
   }
 }
 
-/* ---------------- визуализация ---------------- */
+/* ============================================================
+   ВИЗУАЛИЗАЦИЯ
+   ============================================================ */
 
 class Visualizer {
   constructor(canvas) {
     this.c = canvas;
     this.x = canvas.getContext('2d');
     this.history = [];
-    this.dpr = 1;
-    this.particles = [];
     this.resize();
     this.onResize = () => this.resize();
     window.addEventListener('resize', this.onResize);
@@ -340,7 +914,7 @@ class Visualizer {
     this.w = r.width; this.h = r.height;
     this.x.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.particles = Array.from({ length: 64 }, () => ({
-      a: Math.random() * Math.PI * 2,
+      a: Math.random() * TAU,
       r: 0.28 + Math.random() * 0.55,
       s: 0.15 + Math.random() * 0.6,
       z: 0.3 + Math.random() * 0.7,
@@ -355,7 +929,6 @@ class Visualizer {
     const baseR = Math.min(W, H) * 0.17;
     const amp = Math.min(W, H) * 0.085;
 
-    // фон
     const bg = x.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.8);
     bg.addColorStop(0, 'rgba(24,46,52,0.55)');
     bg.addColorStop(0.55, 'rgba(10,14,20,0.9)');
@@ -363,7 +936,6 @@ class Visualizer {
     x.fillStyle = bg;
     x.fillRect(0, 0, W, H);
 
-    // частицы-«светлячки», дышат вместе с нами
     x.save();
     x.globalCompositeOperation = 'lighter';
     const tsec = t / 1000;
@@ -375,28 +947,26 @@ class Visualizer {
       const alpha = 0.06 + 0.16 * env * p.z;
       x.fillStyle = `rgba(127,227,212,${alpha})`;
       x.beginPath();
-      x.arc(px, py, 1.1 + p.z * 1.2, 0, Math.PI * 2);
+      x.arc(px, py, 1.1 + p.z * 1.2, 0, TAU);
       x.fill();
     }
     x.restore();
 
-    // ядро
     const r = baseR + amp * env;
     const glow = x.createRadialGradient(cx, cy, r * 0.05, cx, cy, r * 3.1);
     glow.addColorStop(0, `rgba(127,227,212,${0.10 + 0.16 * env})`);
     glow.addColorStop(0.45, `rgba(43,143,134,${0.07 + 0.09 * env})`);
     glow.addColorStop(1, 'rgba(43,143,134,0)');
     x.fillStyle = glow;
-    x.beginPath(); x.arc(cx, cy, r * 3.1, 0, Math.PI * 2); x.fill();
+    x.beginPath(); x.arc(cx, cy, r * 3.1, 0, TAU); x.fill();
 
     const core = x.createRadialGradient(cx - r * 0.25, cy - r * 0.3, r * 0.1, cx, cy, r);
     core.addColorStop(0, 'rgba(200,255,246,0.92)');
     core.addColorStop(0.32, 'rgba(127,227,212,0.55)');
     core.addColorStop(1, 'rgba(20,70,70,0.20)');
     x.fillStyle = core;
-    x.beginPath(); x.arc(cx, cy, r, 0, Math.PI * 2); x.fill();
+    x.beginPath(); x.arc(cx, cy, r, 0, TAU); x.fill();
 
-    // кольца
     x.lineWidth = 1;
     for (let i = 0; i < 3; i++) {
       const rr = baseR * (1.45 + i * 0.42) + amp * env * (1 - i * 0.18);
@@ -407,20 +977,18 @@ class Visualizer {
       x.stroke();
     }
 
-    // такт ведения: тонкая дуга прогресса вдоха/выдоха
     if (lead != null) {
       const rr = baseR * 2.55;
       x.lineWidth = 2;
       x.strokeStyle = 'rgba(127,227,212,0.10)';
-      x.beginPath(); x.arc(cx, cy, rr, 0, Math.PI * 2); x.stroke();
+      x.beginPath(); x.arc(cx, cy, rr, 0, TAU); x.stroke();
       x.strokeStyle = 'rgba(127,227,212,0.55)';
       x.beginPath();
-      x.arc(cx, cy, rr, -Math.PI / 2, -Math.PI / 2 + pacerProgress * Math.PI * 2);
+      x.arc(cx, cy, rr, -Math.PI / 2, -Math.PI / 2 + pacerProgress * TAU);
       x.stroke();
       x.lineWidth = 1;
     }
 
-    // «ваше дыхание» — линия внизу
     this.history.push(env);
     if (this.history.length > 260) this.history.shift();
     const hy = H * 0.86, hh = H * 0.075;
@@ -429,19 +997,16 @@ class Visualizer {
     x.beginPath();
     const step = W / 260;
     this.history.forEach((v, i) => {
-      const px = i * step;
-      const py = hy - v * hh;
+      const px = i * step, py = hy - v * hh;
       i === 0 ? x.moveTo(px, py) : x.lineTo(px, py);
     });
     x.stroke();
-
-    if (settings.haptics && phase === 'inhale' && navigator.vibrate) { /* вибро уже вызвано в детекторе */ }
-
-    return r;
   }
 }
 
-/* ---------------- сессия ---------------- */
+/* ============================================================
+   СЕССИЯ
+   ============================================================ */
 
 const Session = {
   active: false,
@@ -459,15 +1024,14 @@ const Session = {
   calmHold: 0,
   rateSamples: [],
   qualitySamples: [],
-  outcome: null,
   space: 0,
   pacerT: 0,
+  guided: false,
 };
 
 function fmtTime(sec) {
   sec = Math.max(0, Math.round(sec));
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return `${m}:${String(s).padStart(2, '0')}`;
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }
 
 function pacerEnv(p, soft) {
@@ -476,8 +1040,21 @@ function pacerEnv(p, soft) {
   return 1 - smoothstep((p - inFrac) / (1 - inFrac));
 }
 
+function stopPreview() {
+  Workshop.loading = false;
+  if (Workshop.timer) { clearInterval(Workshop.timer); Workshop.timer = null; }
+  if (Workshop.engine) {
+    const e = Workshop.engine;
+    Workshop.engine = null;
+    e.stop(true);
+  }
+  const lbl = $('#btn-preview');
+  if (lbl) { lbl.classList.remove('on'); lbl.classList.remove('loading'); lbl.textContent = 'Слушать среду'; }
+}
+
 async function startSession(customDur) {
   if (Session.active) return;
+  stopPreview();
   const dur = customDur || Session.duration || 180;
 
   showScreen('s-session');
@@ -490,32 +1067,27 @@ async function startSession(customDur) {
   Session.calmHold = 0;
   Session.rateSamples = [];
   Session.qualitySamples = [];
-  Session.outcome = null;
   Session.space = 0;
   Session.pacerT = 0;
   Session.startRate = fingerprint.rf ? fingerprint.rf + 1.2 : 6.5;
   Session.targetRate = Session.startRate;
-  Session.guided = false;
 
   setPhaseLabel('Зеркало', 'Просто дышите. Мы подстроимся.');
   $('#rate-out').textContent = '—';
 
-  // аудио — сразу в жесте пользователя (требование iOS)
+  await new Promise((r) => setTimeout(r, 30));
   Session.engine = new AudioEngine();
   Session.engine.init();
   Session.engine.start();
 
-  // визуализация
   if (Session.viz) Session.viz.destroy();
   Session.viz = new Visualizer($('#viz'));
 
-  // визуал живёт сразу — даже пока ждём разрешение на микрофон
   Session.detector = new BreathDetector(Session.engine.ctx);
   Session.guided = !settings.mic;
   setMicState(false);
   Session.raf = requestAnimationFrame(loop);
 
-  // микрофон
   if (settings.mic) {
     try {
       await Session.detector.start();
@@ -546,9 +1118,7 @@ function loop(now) {
 
   const elapsed = (now - Session.startAt) / 1000;
   const total = Session.duration;
-  const progress = clamp(elapsed / total, 0, 1);
 
-  // --- фазы ---
   const mirrorEnd = clamp(total * 0.22, 12, 30);
   const leadEnd = total * 0.8;
   let phase;
@@ -562,17 +1132,15 @@ function loop(now) {
     Session.phase = phase;
   }
 
-  // --- детекция ---
-  const st = Session.detector ? Session.detector.tick(dt) : { env: 0, phase: 'exhale', rate: null, quality: 0, live: false };
+  const st = Session.detector ? Session.detector.tick() : { env: 0, phase: 'exhale', rate: null, quality: 0, live: false };
   const guided = Session.guided || !st.live;
 
-  // --- ведение: цель замедляется ступенями ---
   if (phase !== 'mirror') {
     const leadElapsed = elapsed - mirrorEnd;
     const target = fingerprint.rf || 5.5;
     const steps = Math.min(8, Math.floor(leadElapsed / 30));
     const wanted = Math.max(target, Session.startRate - steps * 0.4);
-    Session.targetRate = Session.targetRate + (wanted - Session.targetRate) * Math.min(1, dt * 0.6);
+    Session.targetRate += (wanted - Session.targetRate) * Math.min(1, dt * 0.6);
   } else {
     Session.targetRate = Session.startRate;
   }
@@ -581,28 +1149,22 @@ function loop(now) {
   const pacerP = (Session.pacerT % period) / period;
   const pEnv = pacerEnv(pacerP, settings.soft);
 
-  // --- итоговая огибающая для звука ---
   const userEnv = st.env;
   const lead = phase === 'lead';
-  const audioEnv = guided
-    ? pEnv
-    : phase === 'mirror'
-      ? userEnv
-      : clamp(0.62 * pEnv + 0.38 * userEnv, 0, 1);
+  const audioEnv = guided ? pEnv : phase === 'mirror' ? userEnv : clamp(0.62 * pEnv + 0.38 * userEnv, 0, 1);
 
-  // --- тишина в финале ---
+  const prevP = Session._lastP == null ? pEnv : Session._lastP;
   Session.space = phase === 'space' ? smoothstep((elapsed - leadEnd) / Math.max(1, total - leadEnd)) : 0;
 
   Session.engine.update({
     env: audioEnv,
     phase: st.phase,
-    slope: guided ? Math.abs(pEnv - (Session._lastP || pEnv)) * 12 : st.slope,
+    slope: guided ? Math.abs(pEnv - prevP) * 12 : st.slope,
     lead: lead || phase === 'space',
     space: Session.space,
   });
   Session._lastP = pEnv;
 
-  // --- визуал ---
   Session.viz.draw({
     env: guided ? pEnv : clamp(0.7 * userEnv + 0.3 * pEnv, 0, 1),
     phase: st.phase,
@@ -612,20 +1174,16 @@ function loop(now) {
     t: now,
   });
 
-  // --- показания ---
   const shownRate = st.rate && !guided ? st.rate : Session.targetRate;
   $('#rate-out').textContent = shownRate ? shownRate.toFixed(1).replace('.', ',') : '—';
   if (st.rate) Session.rateSamples.push(st.rate);
   if (st.quality) Session.qualitySamples.push(st.quality);
   $('#timer').textContent = fmtTime(total - elapsed);
 
-  // --- «минуты до покоя» ---
   if (phase === 'lead' && st.rate) {
     const inCorridor = Math.abs(st.rate - Session.targetRate) <= 1.5;
     Session.calmHold = inCorridor ? Session.calmHold + dt : 0;
-    if (Session.calmHold >= 30 && Session.calmAt == null) {
-      Session.calmAt = elapsed - 30;
-    }
+    if (Session.calmHold >= 30 && Session.calmAt == null) Session.calmAt = elapsed - 30;
   }
 
   if (elapsed >= total) { finishSession('complete'); return; }
@@ -638,10 +1196,7 @@ async function finishSession(status, early) {
   cancelAnimationFrame(Session.raf);
 
   const elapsed = early ? (performance.now() - Session.startAt) / 1000 : Session.duration;
-
   if (Session.detector) Session.detector.stop();
-
-  // финальное затухание: в «пространстве» оно уже почти нулевое
   await Session.engine.stop(status !== 'complete');
 
   const rates = Session.rateSamples.filter((r) => r > 2 && r < 30);
@@ -659,6 +1214,7 @@ async function finishSession(status, early) {
     quality: Math.round(quality * 100),
     soft: settings.soft,
     timbre: settings.timbre,
+    mix: mixName(settings.mix),
     timeOfDay: new Date().getHours(),
     outcome: null,
   };
@@ -672,10 +1228,8 @@ async function finishSession(status, early) {
   history.push(record);
   store.set('history', history);
 
-  // «отпечаток»: после 2+ сессий появляется персональная частота
   if (!fingerprint.rf && rates.length >= 3) {
-    const comfortable = avgRate ? clamp(Math.round((avgRate - 0.6) * 2) / 2, 4.5, 7) : 5.5;
-    fingerprint.rf = comfortable;
+    fingerprint.rf = avgRate ? clamp(Math.round((avgRate - 0.6) * 2) / 2, 4.5, 7) : 5.5;
     store.set('fingerprint', fingerprint);
   }
 
@@ -685,12 +1239,10 @@ async function finishSession(status, early) {
 
 function renderResult(rec) {
   const val = rec.minutesToCalm;
+  $('#res-eyebrow').textContent = 'сессия завершена' + (rec.mix ? ' · ' + rec.mix : '');
   $('#res-minutes').textContent = val != null ? val.toFixed(1).replace('.', ',') : '—';
 
-  const prev = history.length > 1
-    ? history.slice(0, -1).reverse().find((r) => r.minutesToCalm != null)
-    : null;
-
+  const prev = history.length > 1 ? history.slice(0, -1).reverse().find((r) => r.minutesToCalm != null) : null;
   const delta = $('#res-delta');
   delta.classList.remove('flat');
   if (val == null) {
@@ -709,7 +1261,7 @@ function renderResult(rec) {
   $('#res-facts').innerHTML = `
     <div class="fact"><div class="fact-k">длительность</div><div class="fact-v">${fmtTime(rec.dur)}</div></div>
     <div class="fact"><div class="fact-k">ваш ритм</div><div class="fact-v">${rec.rate ? rec.rate.toFixed(1).replace('.', ',') + ' / мин' : '—'}</div></div>
-    <div class="fact"><div class="fact-k">режим</div><div class="fact-v">${rec.mode === 'guided' ? 'по такту' : 'зеркало + ведение'}</div></div>
+    <div class="fact"><div class="fact-k">среда</div><div class="fact-v">${rec.mix || '—'}</div></div>
     <div class="fact"><div class="fact-k">quality</div><div class="fact-v">${rec.quality}%</div></div>
   `;
 
@@ -718,14 +1270,11 @@ function renderResult(rec) {
 
 function saveOutcome(val) {
   const last = history[history.length - 1];
-  if (last && last.outcome == null) {
-    last.outcome = val;
-    store.set('history', history);
-  }
+  if (last && last.outcome == null) { last.outcome = val; store.set('history', history); }
   if (val === 'worse') {
     toast('Спасибо. Попробуем мягче — без задержек и с коротким вдохом');
     settings.soft = true;
-    store.set('settings', settings);
+    saveSettings();
     $('#set-soft').checked = true;
   } else if (val === 'better') {
     toast('Записали. Завтра станет точнее');
@@ -734,7 +1283,216 @@ function saveOutcome(val) {
   }
 }
 
-/* ---------------- отпечаток ---------------- */
+/* ============================================================
+   МАСТЕРСКАЯ СРЕДЫ
+   ============================================================ */
+
+const Workshop = {
+  engine: null,
+  timer: null,
+  t0: 0,
+  loading: false,
+};
+
+function mixName(mix) {
+  const on = Object.entries(mix || {}).filter(([id, v]) => v > 0.02 && layerName(id)).sort((a, b) => b[1] - a[1]);
+  if (!on.length) return 'Только ваше дыхание';
+  const names = on.slice(0, 2).map(([id]) => layerName(id));
+  return names.join(' + ') + (on.length > 2 ? ` +${on.length - 2}` : '');
+}
+
+function renderLayers() {
+  const host = $('#layer-list');
+  if (!host) return;
+  host.innerHTML = '';
+
+  GROUPS.forEach((group) => {
+    let ids;
+    if (group === 'Мои звуки') {
+      ids = customSounds.map((c) => c.id);
+      if (!ids.length) ids = [];
+    } else {
+      ids = Object.keys(LAYERS).filter((id) => LAYERS[id].group === group);
+    }
+    if (!ids.length && group !== 'Мои звуки') return;
+
+    const sec = document.createElement('div');
+    sec.className = 'layer-group';
+    sec.innerHTML = `<div class="group-head">${group}</div>`;
+
+    if (!ids.length) {
+      sec.innerHTML += `<div class="group-empty">Своих звуков пока нет — можно добавить файл ниже.</div>`;
+    }
+
+    ids.forEach((id) => {
+      const def = layerDef(id);
+      if (!def) return;
+      const vol = Math.round(((settings.mix && settings.mix[id]) || 0) * 100);
+      const row = document.createElement('div');
+      row.className = 'layer' + (vol > 0 ? ' on' : '');
+      row.dataset.id = id;
+      row.innerHTML = `
+        <button class="layer-toggle" aria-pressed="${vol > 0}">
+          <span class="l-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">${ICONS[def.icon] || ICONS.waves}</svg></span>
+          <span class="l-name">${escapeHtml(def.name)}</span>
+        </button>
+        <div class="l-controls">
+          <input class="l-vol" type="range" min="0" max="100" step="1" value="${vol}" aria-label="Громкость: ${escapeHtml(def.name)}" />
+          ${def.custom ? '<button class="l-del" title="Удалить">×</button>' : ''}
+        </div>`;
+      sec.appendChild(row);
+
+      const toggle = row.querySelector('.layer-toggle');
+      const slider = row.querySelector('.l-vol');
+
+      toggle.addEventListener('click', () => {
+        const on = !row.classList.contains('on');
+        row.classList.toggle('on', on);
+        toggle.setAttribute('aria-pressed', String(on));
+        settings.mix[id] = on ? Math.max(0.35, slider.value / 100) : 0;
+        slider.value = Math.round(settings.mix[id] * 100);
+        saveSettings();
+        updateMixUI();
+        if (Workshop.engine) {
+          if (settings.mix[id] > 0) Workshop.engine.setLayer(id, settings.mix[id]);
+          else Workshop.engine.setLayer(id, 0);
+        }
+      });
+
+      slider.addEventListener('input', () => {
+        const v = Number(slider.value) / 100;
+        settings.mix[id] = v;
+        row.classList.toggle('on', v > 0);
+        toggle.setAttribute('aria-pressed', String(v > 0));
+        saveSettings();
+        updateMixUI();
+        if (Workshop.engine) Workshop.engine.setLayer(id, v);
+      });
+
+      const del = row.querySelector('.l-del');
+      if (del) del.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        customSounds = customSounds.filter((c) => c.id !== id);
+        delete settings.mix[id];
+        saveSettings();
+        await idbDel(id);
+        renderLayers();
+        updateMixUI();
+        toast('Звук удалён');
+      });
+    });
+
+    host.appendChild(sec);
+  });
+
+  updateMixUI();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function updateMixUI() {
+  const name = mixName(settings.mix);
+  $('#mix-title').textContent = name;
+  const chip = $('#mix-chip-name');
+  if (chip) chip.textContent = name;
+  renderSavedMixes();
+}
+
+function renderSavedMixes() {
+  const host = $('#saved-row');
+  if (!host) return;
+  host.innerHTML = '';
+  (settings.mixes || []).forEach((m, idx) => {
+    const b = document.createElement('button');
+    b.className = 'saved-chip';
+    b.innerHTML = `${escapeHtml(m.name)}<span class="saved-x" data-idx="${idx}">×</span>`;
+    b.addEventListener('click', (e) => {
+      if (e.target.classList.contains('saved-x')) {
+        settings.mixes.splice(idx, 1);
+        saveSettings();
+        renderSavedMixes();
+        return;
+      }
+      settings.mix = Object.assign({}, m.mix);
+      saveSettings();
+      renderLayers();
+      if (Workshop.engine) {
+        Workshop.engine.refreshMix();
+        Object.keys(settings.mix).forEach((id) => {
+          if (settings.mix[id] > 0) Workshop.engine.setLayer(id, settings.mix[id]);
+        });
+      }
+      toast(`Среда «${m.name}»`);
+    });
+    host.appendChild(b);
+  });
+  if (!(settings.mixes || []).length) {
+    host.innerHTML = '<span class="muted-small">Пока пусто — соберите среду и сохраните.</span>';
+  }
+}
+
+function saveCurrentMix() {
+  const name = mixName(settings.mix);
+  if (!Object.values(settings.mix).some((v) => v > 0.02)) {
+    return toast('Включите хотя бы один звук');
+  }
+  settings.mixes = settings.mixes || [];
+  if (settings.mixes.some((m) => m.name === name)) return toast('Такая среда уже есть');
+  settings.mixes.push({ name, mix: Object.assign({}, settings.mix) });
+  saveSettings();
+  renderSavedMixes();
+  toast(`Сохранили «${name}»`);
+}
+
+function togglePreview() {
+  const btn = $('#btn-preview');
+  if (Workshop.engine) { stopPreview(); return; }
+  if (Workshop.loading) return;
+
+  Workshop.loading = true;
+  removeSpinner();
+  btn.textContent = 'Готовим среду…';
+  btn.classList.add('loading');
+
+  // даём браузеру отрисовать состояние, пока синтезируются буферы
+  setTimeout(() => {
+    Workshop.loading = false;
+    Workshop.engine = new AudioEngine();
+    Workshop.engine.init();
+    Workshop.engine.start();
+    btn.classList.remove('loading');
+    btn.classList.add('on');
+    btn.textContent = 'Остановить';
+    Workshop.t0 = performance.now();
+
+    let last = performance.now();
+    Workshop.timer = setInterval(() => {
+      const now = performance.now();
+      const dt = (now - last) / 1000;
+      last = now;
+      Workshop.pacer = (Workshop.pacer || 0) + dt;
+      const period = 10;
+      const p = (Workshop.pacer % period) / period;
+      const e = pacerEnv(p, settings.soft);
+      const slope = (e - (Workshop.lastE == null ? e : Workshop.lastE)) * 12;
+      Workshop.lastE = e;
+      if (Workshop.engine) {
+        Workshop.engine.update({ env: e, phase: p < 0.42 ? 'inhale' : 'exhale', slope, lead: false, space: 0 });
+      }
+    }, 55);
+  }, 30);
+}
+
+function removeSpinner() {
+  const s = document.querySelector('.spin');
+  if (s) s.remove();
+}
+
+/* ============================================================
+   ОТПЕЧАТОК
+   ============================================================ */
 
 function renderFingerprint() {
   const n = history.length;
@@ -747,15 +1505,13 @@ function renderFingerprint() {
     f.innerHTML = `нужно ещё <b>${need - n}</b> ${plural(need - n, 'сессия', 'сессии', 'сессий')} — и мы соберём вашу формулу`;
   } else {
     const rf = fingerprint.rf ? fingerprint.rf.toFixed(1).replace('.', ',') : '5,5';
-    const mode = modeOfHour();
     const timbre = settings.timbre === 'dark' ? 'тёмный тембр' : settings.timbre === 'light' ? 'светлый тембр' : 'нейтральный тембр';
-    f.innerHTML = `<b>${rf}</b> вдоха/мин · ${timbre} · <b>${Math.round(median(history.map(h => h.dur)) / 60)}</b> мин · ${mode}`;
+    const mix = mixName(settings.mix);
+    f.innerHTML = `<b>${rf}</b> вдоха/мин · ${timbre} · <b>${Math.round(median(history.map((h) => h.dur)) / 60)}</b> мин · ${mix}`;
   }
 
   const vals = history.filter((h) => h.minutesToCalm != null).map((h) => h.minutesToCalm);
-  $('#print-median').textContent = vals.length
-    ? `медиана ${median(vals).toFixed(1).replace('.', ',')} мин`
-    : 'пока нет измерений';
+  $('#print-median').textContent = vals.length ? `медиана ${median(vals).toFixed(1).replace('.', ',')} мин` : 'пока нет измерений';
 
   drawChart(vals);
 
@@ -766,27 +1522,20 @@ function renderFingerprint() {
     const better = history.filter((h) => h.outcome === 'better').length;
     const worse = history.filter((h) => h.outcome === 'worse').length;
     const avgQ = Math.round(median(history.map((h) => h.quality)));
-    const rfLine = fingerprint.rf
-      ? `<li><span>ваша частота</span><span class="bar">${fingerprint.rf.toFixed(1).replace('.', ',')} / мин</span></li>`
-      : '';
+    const mixes = {};
+    history.forEach((h) => { if (h.mix) mixes[h.mix] = (mixes[h.mix] || 0) + 1; });
+    const topMix = Object.entries(mixes).sort((a, b) => b[1] - a[1])[0];
     factors.innerHTML = `
-      ${rfLine}
+      ${fingerprint.rf ? `<li><span>ваша частота</span><span class="bar">${fingerprint.rf.toFixed(1).replace('.', ',')} / мин</span></li>` : ''}
+      ${topMix ? `<li><span>чаще всего</span><span class="bar">${escapeHtml(topMix[0])}</span></li>` : ''}
       <li><span>сессий «спокойнее»</span><span class="bar">${better} из ${n}</span></li>
       <li><span>качество сигнала</span><span class="bar">${avgQ}%</span></li>
       ${worse ? `<li><span>«хуже»</span><span class="bar">${worse}</span></li>` : ''}
-      <li><span>оптимальная длительность</span><span class="bar">${Math.round(median(history.map(h => h.dur)) / 30) * 0.5} мин</span></li>
     `;
   }
 
-  $('#sessions-count').textContent = `сессий: ${n}`;
-}
-
-function modeOfHour() {
-  const h = new Date().getHours();
-  if (h >= 5 && h < 12) return 'утро';
-  if (h >= 12 && h < 18) return 'день';
-  if (h >= 18 && h < 23) return 'вечер';
-  return 'ночь';
+  const sc = $('#sessions-count');
+  if (sc) sc.textContent = `сессий: ${n}`;
 }
 
 function plural(n, one, few, many) {
@@ -850,20 +1599,21 @@ function drawChart(vals) {
   x.stroke();
 
   vals.forEach((v, i) => {
-    x.beginPath(); x.arc(px(i), py(v), 2.6, 0, Math.PI * 2);
+    x.beginPath(); x.arc(px(i), py(v), 2.6, 0, TAU);
     x.fillStyle = '#7fe3d4'; x.fill();
   });
 }
 
-/* ---------------- навигация и UI ---------------- */
-
-let currentScreen = 's-intro';
+/* ============================================================
+   НАВИГАЦИЯ
+   ============================================================ */
 
 function showScreen(id) {
   $$('.screen').forEach((s) => s.classList.toggle('active', s.id === id));
-  currentScreen = id;
   if (id === 's-print') setTimeout(renderFingerprint, 60);
   if (id === 's-intro') setTimeout(renderFingerprint, 60);
+  if (id === 's-sound') setTimeout(renderLayers, 40);
+  if (id !== 's-sound') stopPreview();
 }
 
 function toast(text) {
@@ -884,7 +1634,9 @@ function closeSheet(el) {
   el.setAttribute('aria-hidden', 'true');
 }
 
-/* ---------------- события ---------------- */
+/* ============================================================
+   СОБЫТИЯ
+   ============================================================ */
 
 let chosenDuration = 180;
 
@@ -898,7 +1650,6 @@ $$('#duration-row .chip').forEach((chip) => {
 
 $('#btn-start').addEventListener('click', () => startSession(chosenDuration));
 $('#btn-stop').addEventListener('click', () => finishSession('partial', true));
-
 $('#btn-home').addEventListener('click', () => { showScreen('s-intro'); renderFingerprint(); });
 
 $$('.outcome-btn').forEach((b) => {
@@ -931,37 +1682,86 @@ $$('.sheet').forEach((s) => {
   s.addEventListener('click', (e) => { if (e.target === s) closeSheet(s); });
 });
 
-$('#set-bass').addEventListener('input', (e) => {
-  settings.bass = Number(e.target.value);
-  store.set('settings', settings);
-});
-$('#set-timbre').addEventListener('change', (e) => {
-  settings.timbre = e.target.value;
-  store.set('settings', settings);
-  toast('Тембр применится в следующей сессии');
-});
-$('#set-mic').addEventListener('change', (e) => {
-  settings.mic = e.target.checked;
-  store.set('settings', settings);
-});
-$('#set-soft').addEventListener('change', (e) => {
-  settings.soft = e.target.checked;
-  store.set('settings', settings);
-});
-$('#set-haptics').addEventListener('change', (e) => {
-  settings.haptics = e.target.checked;
-  store.set('settings', settings);
+/* звуковая мастерская */
+$('#btn-sound').addEventListener('click', () => showScreen('s-sound'));
+$('#btn-sound-back').addEventListener('click', () => showScreen('s-intro'));
+$('#mix-chip').addEventListener('click', () => showScreen('s-sound'));
+$('#btn-preview').addEventListener('click', togglePreview);
+$('#btn-save-mix').addEventListener('click', saveCurrentMix);
+$('#btn-sound-breathe').addEventListener('click', () => startSession(chosenDuration));
+
+$('#btn-add-custom').addEventListener('click', () => $('#file-custom').click());
+
+$('#file-custom').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  if (file.size > 12 * 1024 * 1024) return toast('Файл больше 12 МБ — не сохраним');
+  try {
+    const arr = await file.arrayBuffer();
+    const buf = await decodeAudio(arr.slice(0), 48000);
+    const id = 'my-' + Date.now().toString(36);
+    const name = (file.name.replace(/\.[^.]+$/, '') || 'свой звук').slice(0, 28);
+    customSounds.push({ id, name, buffer: buf });
+    await idbPut({ id, name, data: arr });
+    settings.mix[id] = 0.5;
+    saveSettings();
+    renderLayers();
+    if (Workshop.engine) Workshop.engine.setLayer(id, 0.5);
+    toast('Добавили. Теперь это ваш звук');
+  } catch (err) {
+    toast('Не получилось прочитать файл — попробуйте mp3 или wav');
+  }
 });
 
-/* начальная синхронизация тумблеров */
+/* настройки */
+$('#set-bass').addEventListener('input', (e) => { settings.bass = Number(e.target.value); saveSettings(); });
+$('#set-timbre').addEventListener('change', (e) => { settings.timbre = e.target.value; saveSettings(); toast('Тембр применится в следующей сессии'); });
+$('#set-volume').addEventListener('input', (e) => {
+  settings.volume = Number(e.target.value) / 100;
+  saveSettings();
+  if (Workshop.engine) {
+    const t = Workshop.engine.ctx.currentTime;
+    Workshop.engine.master.gain.setTargetAtTime(0.18 + 0.60 * settings.volume, t, 0.2);
+  }
+});
+$('#set-response').addEventListener('input', (e) => { settings.response = Number(e.target.value) / 100; saveSettings(); });
+$('#set-room').addEventListener('change', (e) => { settings.room = e.target.value; saveSettings(); toast('Пространство применится в следующей сессии'); });
+$('#set-mic').addEventListener('change', (e) => { settings.mic = e.target.checked; saveSettings(); });
+$('#set-soft').addEventListener('change', (e) => { settings.soft = e.target.checked; saveSettings(); });
+$('#set-haptics').addEventListener('change', (e) => { settings.haptics = e.target.checked; saveSettings(); });
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { closeSheet($('#settings-sheet')); closeSheet($('#help-sheet')); }
+});
+
+/* ============================================================
+   СТАРТ
+   ============================================================ */
+
 $('#set-bass').value = settings.bass;
 $('#set-timbre').value = settings.timbre;
+$('#set-volume').value = Math.round(settings.volume * 100);
+$('#set-response').value = Math.round(settings.response * 100);
+$('#set-room').value = settings.room;
 $('#set-mic').checked = settings.mic;
 $('#set-soft').checked = settings.soft;
 $('#set-haptics').checked = settings.haptics;
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeSheet($('#settings-sheet')), closeSheet($('#help-sheet'));
+renderFingerprint();
+updateMixUI();
+
+loadCustomSounds().then(() => {
+  renderLayers();
 });
 
-renderFingerprint();
+/* Отладочный доступ к состоянию (в продакшн-сборке вырезается).
+   Нужен для автотестов и ручной проверки сценариев. */
+window.__otklik = {
+  Session,
+  Workshop,
+  get settings() { return settings; },
+  get history() { return history; },
+  get fingerprint() { return fingerprint; },
+  get customSounds() { return customSounds; },
+};
